@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -73,10 +74,20 @@ func (c *Client) complete(ctx context.Context, agentName string, req Request, op
 
 	data, _ := json.Marshal(req)
 	log.Messages(ctx, "completions-api", true, data)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
-	}
+
+	// Build the URL with api-version if AZURE_OPENAI_API_VERSION is defined
+    apiVersion := os.Getenv("AZURE_OPENAI_API_VERSION")
+    url := c.BaseURL + "/chat/completions"
+    if apiVersion != "" {
+	    url = url + "?api-version=" + apiVersion
+    }
+    httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(data))
+    if err != nil {
+	    return nil, err
+    }
+	// Log the URL used
+    log.Infof(ctx, "OpenAI Chat Completions URL: %s", httpReq.URL.String())
+	
 	for key, value := range c.Headers {
 		httpReq.Header.Set(key, value)
 	}
