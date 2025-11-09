@@ -1,0 +1,206 @@
+================================================================================
+PROBLEMA: INTEGRAZIONE AZURE OPENAI CON NANOBOT
+================================================================================
+
+DATA: 9 novembre 2025
+SITUAZIONE: Azure OpenAI configurato correttamente ma messaggi non visibili 
+            in tempo reale nel frontend (necessario F5 per vederli)
+
+================================================================================
+ANALISI DEL PROBLEMA
+================================================================================
+
+DIFFERENZA CHIAVE: Azure OpenAI vs OpenAI standard
+---------------------------------------------------
+Azure OpenAI NON fa streaming delle risposte:
+- Restituisce risposte complete in un unico blocco (object: "chat.completion")
+- NON invia chunk progressivi (object: "chat.completion.chunk")
+- I campi "delta" non vengono mai popolati
+- Tutto il contenuto arriva in "message.content" completo
+
+Log di esempio da Azure:
+<-(completions-api)│ {"id":"","object":"chat.completion","created":0,"model":"",
+"choices":[{"index":0,"message":{"role":"assistant","content":"0 + 1 fa **1**. 😊"},
+"finish_reason":"stop"}],...}
+
+FLUSSO CORRENTE (non funziona in tempo reale con Azure):
+---------------------------------------------------------
+1. Client invia messaggio → backend chiama Azure OpenAI
+2. Azure risponde con messaggio COMPLETO (non streaming)
+3. Backend salva il messaggio nello stato
+4. Backend chiama closeProgress() che invia "notifications/resources/updated"
+5. Frontend riceve la notifica e ricarica i messaggi
+6. PROBLEMA: Il punto 5 non avviene in tempo reale, solo dopo F5
+
+CAUSA ROOT:
+-----------
+In pkg/llm/completions/client.go, progress.Send() viene chiamato SOLO quando 
+ci sono "delta.Content" durante lo streaming (righe 195-210). Con Azure che 
+non fa streaming, progress.Send() non viene MAI chiamato e quindi:
+- appendProgress() non viene mai eseguito
+- notifications/resources/updated non viene inviato durante l'esecuzione
+- closeProgress() viene chiamato alla fine ma potrebbe essere troppo tardi o 
+  la notifica non arriva correttamente al frontend
+
+================================================================================
+FILE MODIFICATI DURANTE IL DEBUG (da ripristinare)
+================================================================================
+
+1. pkg/llm/completions/translate.go
+   - Aggiunto generazione ID quando Azure restituisce id="" vuoto
+   - UTILE: Mantenere questa modifica (Azure restituisce sempre id="")
+
+2. pkg/types/completer.go
+   - Aggiunto campo Content oltre a Items
+   - Implementato MarshalJSON per popolare Content da Items
+   - PROBABILMENTE NON NECESSARIO: Era un tentativo per risolvere frontend
+
+3. pkg/llm/completions/client.go
+   - Aggiunto supporto AZURE_OPENAI_API_VERSION (UTILE - mantenere)
+   - Tentato di aggiungere progress.Send() finale (NON ha funzionato - rimosso)
+   - Log di debug aggiunti (UTILI per debug)
+
+4. pkg/api/events.go
+   - Aggiunto printedIDs[id] = struct{}{} per evitare duplicati
+   - UTILE: Mantenere per evitare messaggi duplicati dopo F5
+
+5. pkg/servers/agent/chat_call.go
+   - Aggiunti log in appendProgress() e closeProgress()
+   - UTILE per debug ma non risolve il problema
+
+6. ui/src/lib/chat.svelte.ts
+   - Aggiunto evento 'thread-updated' in chat-done
+   - UTILE per refresh lista conversazioni ma frontend non compilato
+
+7. ui/src/routes/+layout.svelte
+   - Aggiunto listener per 'thread-updated'
+   - UTILE per refresh lista conversazioni ma frontend non compilato
+
+================================================================================
+SOLUZIONE PROPOSTA PER DOMANI
+================================================================================
+
+APPROCCIO: Forzare invio notifiche di progress anche senza streaming
+
+OPZIONE 1: Modificare pkg/llm/completions/client.go
+----------------------------------------------------
+Dopo aver ricevuto la risposta completa da Azure (riga ~275), PRIMA di 
+ritornare, inviare manualmente i progress events per ogni chunk di contenuto:
+
+if !initialized {
+    // Azure ha restituito risposta completa senza streaming
+    // Simuliamo lo streaming inviando progress per il contenuto
+    if opt.ProgressToken != nil && len(resp.Choices) > 0 {
+        choice := resp.Choices[0]
+        if choice.Message != nil && choice.Message.Content.Text != nil {
+            progress.Send(ctx, &types.CompletionProgress{
+                Model:     resp.Model,
+                Agent:     agentName,
+                MessageID: resp.ID,
+                Item: types.CompletionItem{
+                    ID:      fmt.Sprintf("%s-content", resp.ID),
+                    Partial: false,
+                    HasMore: false,
+                    Content: &mcp.Content{
+                        Type: "text",
+                        Text: *choice.Message.Content.Text,
+                    },
+                },
+            }, opt.ProgressToken)
+        }
+    }
+}
+
+OPZIONE 2: Modificare pkg/servers/agent/chat_call.go
+-----------------------------------------------------
+Assicurarsi che closeProgress() invii correttamente la notifica E che 
+questa venga propagata al client EventSource corretto.
+
+Verificare che:
+- session.SendPayload() funziona correttamente
+- Il context non è già chiuso quando closeProgress() viene chiamato
+- La notifica arriva effettivamente al client giusto
+
+OPZIONE 3: Modificare il backend per forzare un "fake streaming"
+-----------------------------------------------------------------
+Quando Azure restituisce una risposta completa, spezzarla in chunk artificiali
+e inviarli come se fossero streaming, così il codice esistente funziona.
+
+================================================================================
+MODIFICHE DA MANTENERE
+================================================================================
+
+1. pkg/llm/completions/translate.go - Generazione ID quando vuoto
+2. pkg/llm/completions/client.go - Supporto AZURE_OPENAI_API_VERSION
+3. pkg/api/events.go - Aggiunta ID a printedIDs per evitare duplicati
+
+================================================================================
+MODIFICHE DA SCARTARE
+================================================================================
+
+1. pkg/types/completer.go - Campo Content aggiuntivo
+2. ui/src/lib/chat.svelte.ts - Evento thread-updated (frontend non compilato)
+3. ui/src/routes/+layout.svelte - Listener thread-updated (frontend non compilato)
+4. pkg/servers/agent/chat_call.go - Log di debug (utili ma non risolvono)
+
+================================================================================
+COMANDI PER DOMANI
+================================================================================
+
+# Ripristina tutte le modifiche
+git restore pkg/api/events.go
+git restore pkg/llm/completions/client.go
+git restore pkg/llm/completions/translate.go
+git restore pkg/servers/agent/chat_call.go
+git restore pkg/types/completer.go
+git restore ui/src/lib/chat.svelte.ts
+git restore ui/src/routes/+layout.svelte
+
+# Riapplica SOLO le modifiche necessarie:
+# 1. AZURE_OPENAI_API_VERSION in client.go
+# 2. Generazione ID in translate.go
+# 3. printedIDs fix in events.go
+# 4. Implementa OPZIONE 1 o 2 per il problema dello streaming
+
+================================================================================
+CONFIGURAZIONE AZURE OPENAI
+================================================================================
+
+File: nanobot.env
+-----------------
+OPENAI_API_KEY=<tua-chiave>
+OPENAI_BASE_URL=https://malb-mg6nfr1i-eastus2.cognitiveservices.azure.com/openai/deployments/gpt-4o
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+
+File: nanobot.yaml
+------------------
+agents:
+  - name: default
+    model: gpt-4o
+    instructions: Sei un assistente utile.
+
+Docker:
+-------
+docker run -d --name nanobot -p 8080:8080 \
+  -v $(pwd)/nanobot.yaml:/data/nanobot.yaml \
+  -v $(pwd)/nanobot.env:/data/nanobot.env \
+  -e OPENAI_API_KEY=$(grep OPENAI_API_KEY nanobot.env | cut -d '=' -f 2) \
+  -e OPENAI_BASE_URL=$(grep OPENAI_BASE_URL nanobot.env | cut -d '=' -f 2) \
+  -e AZURE_OPENAI_API_VERSION=$(grep AZURE_OPENAI_API_VERSION nanobot.env | cut -d '=' -f 2) \
+  nanobot-image
+
+================================================================================
+RIFERIMENTI CODICE
+================================================================================
+
+File chiave per la soluzione:
+- pkg/llm/completions/client.go:140-280 - Gestione streaming e risposte complete
+- pkg/llm/progress/send.go - Invio notifiche progress
+- pkg/servers/agent/chat_call.go:appendProgress() - Intercetta progress events
+- pkg/api/events.go:printProgressMessage() - Gestisce notifiche resources/updated
+
+Flusso desiderato:
+client.Complete() → progress.Send() → appendProgress() → notifications/resources/updated 
+→ printProgressMessage() → printProgressURI() → writeEvent("message") → Frontend
+
+================================================================================
