@@ -6,6 +6,7 @@
 	import Notifications from '$lib/components/Notifications.svelte';
 	import { chatApi } from '$lib/chat.svelte';
 	import { notifications } from '$lib/stores/notifications.svelte';
+	import { threadUpdates } from '$lib/stores/threads.svelte';
 	import { setNotificationContext } from '$lib/context/notifications.svelte';
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
@@ -25,6 +26,13 @@
 
 	// Set notification context for global access
 	setNotificationContext(notifications);
+
+	// Function to reload threads
+	async function reloadThreads() {
+		console.log('[Layout] reloadThreads called');
+		threads = await chatApi.getThreads();
+		console.log('[Layout] threads reloaded, count:', threads.length);
+	}
 
 	onMount(async () => {
 		// Load sidebar state from localStorage (desktop only)
@@ -51,6 +59,14 @@
 
 		threads = await chatApi.getThreads();
 		isLoading = false;
+
+		// Subscribe to thread updates
+		const unsubscribe = threadUpdates.subscribe(reloadThreads);
+		
+		// Return cleanup function
+		return () => {
+			unsubscribe();
+		};
 	});
 
 	function toggleDesktopSidebar() {

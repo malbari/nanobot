@@ -18,6 +18,7 @@ import {
 	type Resources
 } from './types';
 import { getNotificationContext } from './context/notifications.svelte';
+import { threadUpdates } from './stores/threads.svelte';
 
 interface CallToolResult {
 	content?: ToolOutputItem[];
@@ -438,11 +439,14 @@ export class ChatService {
 				} else if (event.type == 'chat-in-progress') {
 					this.isLoading = true;
 				} else if (event.type == 'chat-done') {
+					console.log('[ChatService] Received chat-done event, calling threadUpdates.refresh()');
 					this.isLoading = false;
 					for (const waiting of this.onChatDone) {
 						waiting();
 					}
 					this.onChatDone = [];
+					// Refresh thread list to update title
+					threadUpdates.refresh();
 				} else if (event.type == 'elicitation/create') {
 					this.elicitations = [
 						...this.elicitations,

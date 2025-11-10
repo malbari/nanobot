@@ -8,13 +8,20 @@ import (
 
 	"github.com/nanobot-ai/nanobot/pkg/mcp"
 	"github.com/nanobot-ai/nanobot/pkg/types"
+	"github.com/nanobot-ai/nanobot/pkg/uuid"
 )
 
 func toResponse(resp *Response, created time.Time) (*types.CompletionResponse, error) {
+	// Azure OpenAI returns empty ID, generate one if needed
+	messageID := resp.ID
+	if messageID == "" {
+		messageID = uuid.String()
+	}
+	
 	result := &types.CompletionResponse{
 		Model: resp.Model,
 		Output: types.Message{
-			ID:      resp.ID,
+			ID:      messageID,
 			Created: &created,
 			Role:    "assistant",
 		},
@@ -26,7 +33,7 @@ func toResponse(resp *Response, created time.Time) (*types.CompletionResponse, e
 			// Handle content
 			if choice.Message.Content.Text != nil {
 				result.Output.Items = append(result.Output.Items, types.CompletionItem{
-					ID: fmt.Sprintf("%s-content", resp.ID),
+					ID: fmt.Sprintf("%s-content", messageID),
 					Content: &mcp.Content{
 						Type: "text",
 						Text: *choice.Message.Content.Text,
@@ -37,7 +44,7 @@ func toResponse(resp *Response, created time.Time) (*types.CompletionResponse, e
 			// Handle tool calls
 			for i, toolCall := range choice.Message.ToolCalls {
 				result.Output.Items = append(result.Output.Items, types.CompletionItem{
-					ID: fmt.Sprintf("%s-%d", resp.ID, i),
+					ID: fmt.Sprintf("%s-%d", messageID, i),
 					ToolCall: &types.ToolCall{
 						CallID:    toolCall.ID,
 						Name:      toolCall.Function.Name,
@@ -49,7 +56,7 @@ func toResponse(resp *Response, created time.Time) (*types.CompletionResponse, e
 			// Handle refusal
 			if choice.Message.Refusal != nil {
 				result.Output.Items = append(result.Output.Items, types.CompletionItem{
-					ID: fmt.Sprintf("%s-refusal", resp.ID),
+					ID: fmt.Sprintf("%s-refusal", messageID),
 					Content: &mcp.Content{
 						Type: "text",
 						Text: "REFUSAL: " + *choice.Message.Refusal,

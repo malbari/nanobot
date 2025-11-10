@@ -103,8 +103,81 @@ func (c *Client) complete(ctx context.Context, agentName string, req Request, op
 		return nil, fmt.Errorf("failed to get response from OpenAI Chat Completions API: %s %q", httpResp.Status, string(body))
 	}
 
+	// Peek first bytes to detect if it's SSE or complete JSON
+	reader := bufio.NewReader(httpResp.Body)
+	firstBytes, err := reader.Peek(20)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to peek response: %w", err)
+	}
+
+	// Check if response is in SSE format (starts with "data: ") or complete JSON (starts with "{")
+	isSSE := strings.HasPrefix(strings.TrimSpace(string(firstBytes)), "data: ")
+
+	if !isSSE {
+		// Azure OpenAI returns complete JSON response (no streaming)
+		bodyBytes, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+
+		var resp Response
+		if err := json.Unmarshal(bodyBytes, &resp); err != nil {
+			return nil, fmt.Errorf("failed to decode complete response: %w", err)
+		}
+
+		log.Messages(ctx, "completions-api", false, bodyBytes)
+
+		// Generate ID if empty (Azure returns empty ID)
+		if resp.ID == "" {
+			resp.ID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+		}
+
+		// Send progress for the complete response
+		if opt.ProgressToken != nil && len(resp.Choices) > 0 {
+			choice := resp.Choices[0]
+			if choice.Message != nil && choice.Message.Content.Text != nil {
+				progress.Send(ctx, &types.CompletionProgress{
+					Model:     resp.Model,
+					Agent:     agentName,
+					MessageID: resp.ID,
+					Item: types.CompletionItem{
+						ID:      fmt.Sprintf("%s-content", resp.ID),
+						Partial: false,
+						HasMore: false,
+						Content: &mcp.Content{
+							Type: "text",
+							Text: *choice.Message.Content.Text,
+						},
+					},
+				}, opt.ProgressToken)
+			}
+
+			// Send progress for tool calls if any
+			for i, toolCall := range choice.Message.ToolCalls {
+				progress.Send(ctx, &types.CompletionProgress{
+					Model:     resp.Model,
+					Agent:     agentName,
+					MessageID: resp.ID,
+					Item: types.CompletionItem{
+						ID:      fmt.Sprintf("%s-t-%d", resp.ID, i),
+						Partial: false,
+						HasMore: false,
+						ToolCall: &types.ToolCall{
+							CallID:    toolCall.ID,
+							Name:      toolCall.Function.Name,
+							Arguments: toolCall.Function.Arguments,
+						},
+					},
+				}, opt.ProgressToken)
+			}
+		}
+
+		return &resp, nil
+	}
+
+	// Handle SSE streaming format - process line by line in real-time
 	var (
-		lines       = bufio.NewScanner(httpResp.Body)
+		lines       = bufio.NewScanner(reader)
 		resp        Response
 		initialized = false
 		toolCalls   = make(map[int]*ToolCall)
@@ -144,6 +217,11 @@ func (c *Client) complete(ctx context.Context, agentName string, req Request, op
 			initialized = true
 		}
 
+		// Update ID if empty and chunk has ID (Azure sends ID in later chunks)
+		if resp.ID == "" && chunk.ID != "" {
+			resp.ID = chunk.ID
+		}
+
 		// Handle usage information
 		if chunk.Usage != nil {
 			resp.Usage = chunk.Usage
@@ -156,6 +234,58 @@ func (c *Client) complete(ctx context.Context, agentName string, req Request, op
 			}
 
 			delta := choice.Delta
+			
+			// Azure OpenAI may send complete message instead of delta
+			// Handle this case by checking if Message is present
+			if delta == nil && choice.Message != nil {
+				// Copy complete message to response
+				resp.Choices[choice.Index].Message = choice.Message
+				
+				// Generate ID if empty
+				if resp.ID == "" {
+					resp.ID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+				}
+				
+				// Send progress for complete message
+				if opt.ProgressToken != nil && choice.Message.Content.Text != nil {
+					progress.Send(ctx, &types.CompletionProgress{
+						Model:     resp.Model,
+						Agent:     agentName,
+						MessageID: resp.ID,
+						Item: types.CompletionItem{
+							ID:      fmt.Sprintf("%s-%d", resp.ID, choice.Index),
+							Partial: false,
+							HasMore: false,
+							Content: &mcp.Content{
+								Type: "text",
+								Text: *choice.Message.Content.Text,
+							},
+						},
+					}, opt.ProgressToken)
+				}
+				
+				// Handle tool calls in complete message
+				for i, toolCall := range choice.Message.ToolCalls {
+					progress.Send(ctx, &types.CompletionProgress{
+						Model:     resp.Model,
+						Agent:     agentName,
+						MessageID: resp.ID,
+						Item: types.CompletionItem{
+							ID:      fmt.Sprintf("%s-t-%d", resp.ID, i),
+							Partial: false,
+							HasMore: false,
+							ToolCall: &types.ToolCall{
+								CallID:    toolCall.ID,
+								Name:      toolCall.Function.Name,
+								Arguments: toolCall.Function.Arguments,
+							},
+						},
+					}, opt.ProgressToken)
+				}
+				
+				continue
+			}
+			
 			if delta == nil {
 				continue
 			}
@@ -175,20 +305,23 @@ func (c *Client) complete(ctx context.Context, agentName string, req Request, op
 				}
 				*resp.Choices[choice.Index].Message.Content.Text += *delta.Content
 
-				progress.Send(ctx, &types.CompletionProgress{
-					Model:     resp.Model,
-					Agent:     agentName,
-					MessageID: resp.ID,
-					Item: types.CompletionItem{
-						ID:      fmt.Sprintf("%s-%d", resp.ID, choice.Index),
-						Partial: true,
-						HasMore: !isFinished,
-						Content: &mcp.Content{
-							Type: "text",
-							Text: *delta.Content,
+				// Only send progress if we have a valid message ID
+				if resp.ID != "" && opt.ProgressToken != nil {
+					progress.Send(ctx, &types.CompletionProgress{
+						Model:     resp.Model,
+						Agent:     agentName,
+						MessageID: resp.ID,
+						Item: types.CompletionItem{
+							ID:      fmt.Sprintf("%s-%d", resp.ID, choice.Index),
+							Partial: true,
+							HasMore: !isFinished,
+							Content: &mcp.Content{
+								Type: "text",
+								Text: *delta.Content,
+							},
 						},
-					},
-				}, opt.ProgressToken)
+					}, opt.ProgressToken)
+				}
 			}
 
 			// Handle tool calls
@@ -212,21 +345,24 @@ func (c *Client) complete(ctx context.Context, agentName string, req Request, op
 						toolCalls[index].Function.Arguments += toolCall.Function.Arguments
 					}
 
-					progress.Send(ctx, &types.CompletionProgress{
-						Model:     resp.Model,
-						Agent:     agentName,
-						MessageID: resp.ID,
-						Item: types.CompletionItem{
-							ID:      fmt.Sprintf("%s-t-%d", resp.ID, index),
-							Partial: true,
-							HasMore: !isFinished,
-							ToolCall: &types.ToolCall{
-								CallID:    toolCalls[index].ID,
-								Name:      toolCalls[index].Function.Name,
-								Arguments: toolCall.Function.Arguments,
+					// Only send progress if we have a valid message ID
+					if resp.ID != "" && opt.ProgressToken != nil {
+						progress.Send(ctx, &types.CompletionProgress{
+							Model:     resp.Model,
+							Agent:     agentName,
+							MessageID: resp.ID,
+							Item: types.CompletionItem{
+								ID:      fmt.Sprintf("%s-t-%d", resp.ID, index),
+								Partial: true,
+								HasMore: !isFinished,
+								ToolCall: &types.ToolCall{
+									CallID:    toolCalls[index].ID,
+									Name:      toolCalls[index].Function.Name,
+									Arguments: toolCall.Function.Arguments,
+								},
 							},
-						},
-					}, opt.ProgressToken)
+						}, opt.ProgressToken)
+					}
 				}
 			}
 

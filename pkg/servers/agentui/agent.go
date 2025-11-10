@@ -2,8 +2,11 @@ package agentui
 
 import (
 	"context"
+	"time"
 
+	"github.com/nanobot-ai/nanobot/pkg/log"
 	"github.com/nanobot-ai/nanobot/pkg/mcp"
+	pkgsession "github.com/nanobot-ai/nanobot/pkg/session"
 	"github.com/nanobot-ai/nanobot/pkg/sessiondata"
 	"github.com/nanobot-ai/nanobot/pkg/tools"
 	"github.com/nanobot-ai/nanobot/pkg/types"
@@ -58,18 +61,54 @@ func (s *Server) describeSession(ctx context.Context, args any) <-chan struct{} 
 	session.Get(types.DescriptionSessionKey, &description)
 	if description == "" {
 		go func() {
-			defer close(result)
 			ret, err := s.runtime.Call(ctx, "nanobot.summary", "nanobot.summary", args)
 			if err != nil {
+				log.Errorf(ctx, "Failed to generate title: %v", err)
+				close(result)
 				return
 			}
 			for _, content := range ret.Content {
 				if content.Type == "text" {
 					description = content.Text
+					log.Infof(ctx, "Generated title: %q", description)
 					session.Set(types.DescriptionSessionKey, description)
+					
+					// Update database with the new description
+					var manager pkgsession.Manager
+					if session.Get(pkgsession.ManagerSessionKey, &manager) {
+						log.Infof(ctx, "Found manager in session")
+						// Get session ID from the parent session state
+						state, err := session.State()
+						if err == nil && state != nil {
+							sessionID := state.ID
+							log.Infof(ctx, "Session ID: %s", sessionID)
+							if sessionID != "" {
+								dbSession, err := manager.DB.Get(ctx, sessionID)
+								if err != nil {
+									log.Errorf(ctx, "Failed to get session from DB: %v", err)
+								} else if dbSession != nil {
+									log.Infof(ctx, "Updating DB session description to: %q", description)
+									dbSession.Description = description
+									if err := manager.DB.Update(ctx, dbSession); err != nil {
+										log.Errorf(ctx, "Failed to update session in DB: %v", err)
+									} else {
+										log.Infof(ctx, "Successfully updated session description in DB")
+										// Small delay to ensure DB commit is complete
+										time.Sleep(50 * time.Millisecond)
+									}
+								}
+							}
+						} else {
+							log.Errorf(ctx, "Failed to get session state: %v", err)
+						}
+					} else {
+						log.Infof(ctx, "Manager not found in session")
+					}
 					break
 				}
 			}
+			// Close channel only after DB is updated
+			close(result)
 		}()
 	} else {
 		close(result)
