@@ -94,7 +94,7 @@ func (s *Server) describeSession(ctx context.Context, args any) <-chan struct{} 
 									} else {
 										log.Infof(ctx, "Successfully updated session description in DB")
 										// Small delay to ensure DB commit is complete
-										time.Sleep(50 * time.Millisecond)
+										time.Sleep(200 * time.Millisecond)
 									}
 								}
 							}
