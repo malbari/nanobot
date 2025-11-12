@@ -72,7 +72,7 @@ func (s *Server) describeSession(ctx context.Context, args any) <-chan struct{} 
 					description = content.Text
 					log.Infof(ctx, "Generated title: %q", description)
 					session.Set(types.DescriptionSessionKey, description)
-					
+
 					// Update database with the new description
 					var manager pkgsession.Manager
 					if session.Get(pkgsession.ManagerSessionKey, &manager) {
@@ -94,7 +94,7 @@ func (s *Server) describeSession(ctx context.Context, args any) <-chan struct{} 
 									} else {
 										log.Infof(ctx, "Successfully updated session description in DB")
 										// Small delay to ensure DB commit is complete
-										time.Sleep(200 * time.Millisecond)
+										time.Sleep(500 * time.Millisecond)
 									}
 								}
 							}
