@@ -1,9 +1,14 @@
-#!/bin/bash -x
+#!/bin/bash
+
+PORT=30000
+NAME="nanobot"
 
 export $(grep -v '^#' nanobot.env | xargs)
 
-docker run --rm \
-  -p 8080:8080 \
+docker run -d --restart unless-stopped -it \
+  --add-host=host.docker.internal:host-gateway \
+  --name $NAME \
+  -p ${PORT}:8080 \
   -v $(pwd)/nanobot.yaml:/app/nanobot.yaml \
   -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   -e OPENAI_BASE_URL="$OPENAI_BASE_URL" \
