@@ -1,16 +1,1 @@
-agents:
-  dealer:
-    name: MCP-UI for Apache Superset
-    description: |
-      Server MCP-UI per Apache Superset
-    instructions: |
-      Sei un utile assistente conversazionale che usa un server MCP-UI di Apache Superset per visualizzare info e dashboar di Apache Superset
-    starterMessages:
-      - "Mostrami l'elenco delle Dashboard"
-      - "Mostrami la Sales Dashboard"
-    model: gpt-4.1
-    mcpServers: apache-superset-mcp-ui
-
-mcpServers:
-  apache-superset-mcp-ui:
-    url: http://host.docker.internal:3000/mcp
+../nanobot-config/nanobot.yaml.BASE
